@@ -83,6 +83,22 @@ class Request:
         self.length = 0   # length of the request body, if any
         self.body = None  # contents of the request body, if any
 
+# Topic object to be used for creating an array of topics to be used
+# and the data for these topics
+class Topic:
+    def __init__(self, name):
+        self.name = name            # the string for the topic name
+        self.relatedMessages = []   # The messages that contain the topic
+        self.likeCount = 0          # The total number of likes the topic has
+        self.numMessages = 0        # how many messages have mentioned the topic
+        self.messageIDs = []        # An array to store message numbers
+
+global topics
+topics = [Topic("holycross"), Topic("music"), Topic("whatever")] # An array to store the topics, with starting data
+
+global versionNum
+versionNum = 0 # for the versioning of the topics list
+updates = threading.Condition()
 
 # Response objects are used to hold information associated with a single HTTP
 # response that will be sent to a client. The code is required, and should be
@@ -391,10 +407,95 @@ def handle_one_http_request(conn):
     if req.method == "GET":
         resp = handle_http_get(req, conn)
     elif req.method == "POST" or req.method == "PUT":
-        log("HTTP method '%s' is not yet supported by this server" % (req.method))
-        resp = Response("405 METHOD NOT ALLOWED",
-                "text/plain",
-                "PUT and POST methods not yet supported")
+        # POST a message     
+        if req.path.startswith("/whisper/messages"):
+            body = req.body.split("\n") # read in the payload, separating the tags from the message
+            if len(body) != 3:
+                resp = Response("400 BAD REQUEST", "text/plain", "There was an unexpected number of lines")
+            else:
+                # read the string that starts with "tags... ", into an array
+                tagList = body[0].split(" ")
+                tags = tagList[1:] # an array of the tags
+                # if no topics are given, assign the message to "whatever"
+                if tags[0] == "":
+                    tags[0] = "whatever"
+                # read in the line that starts with "messages..."
+                messageList = body[1].split(" ")
+                messageList = messageList[1:] # an array of the message
+                message = ""
+                # turn the message back into one string
+                for i in messageList:
+                    message += i
+                    message += " "
+                print("The message: " + message)
+                # loop through the topics, and for each one, add the message to it
+                for i in tags:
+                    print(i)
+                    # need to update the version number
+                    with updates:
+                        # note: need to specify that I am dealing with the global variable
+                        # otherwise the code will try to access a local variable
+                        global versionNum                    
+                        versionNum += 1
+                        updates.notify_all()
+                    exists = False # determines if the topic needs to be added
+                    for j in topics:
+                        if j.name == i:
+                            j.relatedMessages.append(message)
+                            j.messageIDs.append(j.name + "." + str(j.numMessages))
+                            j.numMessages += 1
+                            exists = True
+                            break
+                    if exists:
+                        continue
+                    # if a topic does not exist, add it along with associated messages and like-count
+                    new = Topic(i)
+                    new.numMessages = 1
+                    new.relatedMessages.append(message)
+                    new.messageIDs.append(i + "." + "0")
+                    topics.append(new)
+                    # versionNum += 1
+                        
+                    print("New topic added: " + i)
+                
+                # versionNum += 1
+                resp = Response("200 OK", "text/plain", "success")
+        # POST likes
+        elif req.path.startswith("/whisper/like"):
+            # get the TOPIC from the req.path
+            path = req.path.split("/")
+            reqTopic = path[3]
+            found = False
+            # find the topic
+            for i in topics:
+                if i.name == reqTopic:
+                    found = True
+                    # increment the topic's like count
+                    i.likeCount += 1
+                    with updates:
+                        #global versionNum
+                        versionNum += 1
+                        updates.notify_all()
+                        resp = Response("200 OK", "text/plain", "success")
+            # if the topic does not exist, send an error message
+            if found == False:
+                resp = Response("404 NOT FOUND", "text/plain", "This topic does not exist")
+        # POST Downvotes
+        elif req.path.startswith("/whisper/downvote"):
+            # get the message ID that it is trying to downvote
+            path = req.path.split("/")
+            # splits up the ID so the topic name and message number can be located
+            reqID = path[3].split(".")
+            for i in topics:
+                if i.name == reqID[0]:
+                    i.relatedMessages[int(reqID[1])] = "(This message was removed.)"
+                    with updates:
+                        versionNum += 1
+                        updates.notify_all()
+                        resp = Response("200 OK", "text/plain", "success")
+                   
+        else:
+            resp = Response("400 BAD REQUEST", "text/plain", "There is no POST method for this path")
     else:
         log("HTTP method '%s' is not recognized by this server" % (req.method))
         resp = Response("405 METHOD NOT ALLOWED",
@@ -594,6 +695,53 @@ def handle_http_get_file(url_path):
         log("Error encountered reading from file")
         return Response("403 FORBIDDEN", "text/plain", "Permission denied: " + url_path)
 
+# handle the GET topics list
+def handle_http_get_topics(req):
+    # split the req path to figure out the version number
+    path = req.path.split("=")
+    version = int(path[1])
+    with updates:
+        # Need to wait on showing the topics until the version numbers line up
+        while versionNum < version:
+            updates.wait()
+        # send the version number
+        data = str(version) + "\n"
+        # for each topic, print out its number of messages, like count, and name
+        for i in topics:
+            data += str(i.numMessages) + " " + str(i.likeCount) + " " + i.name + "\n"
+        # send that data back to be displayed 
+        return Response("200 OK", "text/plain", data)
+    
+# Get the message feed for a topic
+def handle_http_get_feed(req):
+    path = req.path.split("/")
+    path2 = path[3].split("?")
+    reqTopic = path2[0] # topic that we want the feed for
+    path3 = path2[1].split("=")
+    version = int(path3[1]) # version number that we are working with
+    with updates:
+        contains = False
+        global topics  
+        for specTop in topics:
+            # find the topic
+            if specTop.name == reqTopic:
+                contains = True
+                data = str(version) + "\n"
+                # add each message for the topic to the repsonse
+                if specTop.numMessages > 10:
+                    for specMes in specTop.relatedMessages[specTop.numMessages-10:]:
+                        data += specTop.messageIDs[specTop.relatedMessages.index(specMes)]
+                        data += " " + specMes +"\n"
+                else:
+                    for specMes in specTop.relatedMessages:
+                        data += specTop.messageIDs[specTop.relatedMessages.index(specMes)]
+                        data += " " + specMes +"\n"
+        if contains == False:
+            return Response("404 NOT FOUND", "text/plain", "This topic has not been mentioned.")
+        global versionNum
+        while versionNum < version:
+            updates.wait()
+        return Response("200 OK", "text/plain", data)
 
 # handle_http_get() returns an appropriate response for a GET request
 def handle_http_get(req, conn):
@@ -608,6 +756,10 @@ def handle_http_get(req, conn):
         resp = handle_http_get_file(req.path + "index.html")
     elif req.path.startswith("/hello?"):
         resp = handle_http_get_hello(req, conn)
+    elif req.path.startswith("/whisper/topics?version="):
+        resp = handle_http_get_topics(req)
+    elif req.path.startswith("/whisper/feed/"):
+        resp = handle_http_get_feed(req)
     else:
         resp = handle_http_get_file(req.path)
     return resp
@@ -705,6 +857,7 @@ log("Server can be accessed at URLs such as:")
 log(f"    http://{server_host}:{server_port}/")
 log(f"    http://{server_host}:{server_port}/welcome.html")
 log(f"    http://{server_host}:{server_port}/status.html")
+log(f"    http://{server_host}:{server_port}/whisper.html")
 log("Ready for connections...")
 
 try:
